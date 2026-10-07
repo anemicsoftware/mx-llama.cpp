@@ -883,6 +883,26 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+#if defined(GGML_USE_HIP)
+    // On ROCm a large copy from pageable host memory can fault with "Page not present" once the runtime has
+    // pinned enough of it (seen restoring recurrent-state checkpoints under layer split on gfx906).
+    // Stage large uploads through our own pinned buffer instead.
+    constexpr size_t staging_min  = 1u << 20;
+    constexpr size_t staging_size = 4u << 20;
+    if (size >= staging_min) {
+        static thread_local void * staging = nullptr; // intentionally never freed: the runtime may already be torn down at exit
+        if (staging == nullptr) {
+            CUDA_CHECK(cudaMallocHost(&staging, staging_size));
+        }
+        for (size_t done = 0; done < size; done += staging_size) {
+            const size_t n = std::min(staging_size, size - done);
+            memcpy(staging, (const char *) data + done, n);
+            CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset + done, staging, n, cudaMemcpyHostToDevice, cudaStreamPerThread));
+            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        }
+        return;
+    }
+#endif
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
