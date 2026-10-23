@@ -7620,6 +7620,92 @@ struct test_kda_gate : public test_case {
     }
 };
 
+// GDN gate inputs: MUL_MAT(alpha) -> RESHAPE -> ADD(dt) -> SOFTPLUS -> MUL(A) -> RESHAPE and MUL_MAT(beta) -> RESHAPE -> SIGMOID
+// (one kernel on GCN at decode sizes); the final ADD only joins the two outputs for the comparison
+struct test_gdn_ab : public test_case {
+    const int64_t k, h, n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GDN_AB";
+    }
+    std::string vars() override {
+        return VARS_TO_STR3(k, h, n_tokens);
+    }
+    bool run_whole_graph() override { return true; }
+
+    test_gdn_ab(int64_t k = 2560, int64_t h = 48, int64_t n_tokens = 1) : k(k), h(h), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_tokens);
+        ggml_tensor * wa = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, h);
+        ggml_tensor * wb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, h);
+        ggml_tensor * dt = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, h);
+        ggml_tensor * A  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, h);
+        ggml_tensor * alpha = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, wa, x), h, n_tokens, 1);
+        ggml_tensor * gate  = ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, alpha, dt)), A);
+        gate = ggml_reshape_4d(ctx, gate, 1, h, n_tokens, 1);
+        ggml_tensor * beta = ggml_reshape_4d(ctx, ggml_mul_mat(ctx, wb, x), 1, h, n_tokens, 1);
+        beta = ggml_sigmoid(ctx, beta);
+        ggml_tensor * out = ggml_add(ctx, gate, beta);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// SCALE -> SILU -> q8_0 MUL_MAT -> RESHAPE -> gated DSV4_HC_PRE (hyper-connection up projection + stream mix; one
+// kernel on GCN at decode sizes)
+struct test_hc_up_pre : public test_case {
+    const int64_t n_embd, k, n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "HC_UP_PRE";
+    }
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, k, n_tokens);
+    }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+
+    test_hc_up_pre(int64_t n_embd = 2560, int64_t k = 320, int64_t n_tokens = 1) : n_embd(n_embd), k(k), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * lo = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_tokens);
+        ggml_tensor * w  = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k, 4*n_embd);
+        ggml_tensor * xn = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 4, n_tokens);
+        ggml_tensor * a  = ggml_silu(ctx, ggml_scale(ctx, lo, 0.25f));
+        ggml_tensor * g  = ggml_mul_mat(ctx, w, a);
+        ggml_tensor * out = ggml_dsv4_hc_pre_gated(ctx, xn, ggml_reshape_3d(ctx, g, n_embd, 4, n_tokens), 0.25f);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// inject -> SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST -> RMS_NORM -> MUL (hyper-connection combine + next norm;
+// fused on CUDA/HIP into one or two kernels)
+struct test_hc_combine_norm : public test_case {
+    const int64_t n_embd;
+    const int64_t n_tokens;
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "HC_COMBINE_NORM"; }
+    std::string vars() override { return VARS_TO_STR2(n_embd, n_tokens); }
+    bool run_whole_graph() override { return true; }
+    test_hc_combine_norm(int64_t n_embd = 2560, int64_t n_tokens = 3) : n_embd(n_embd), n_tokens(n_tokens) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hc = 4;
+        ggml_tensor * bo       = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_tensor * inject   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+        ggml_tensor * w_norm   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, hc);
+        ggml_set_name(bo, "bo"); ggml_set_name(residual, "residual"); ggml_set_name(inject, "inject"); ggml_set_name(w_norm, "w_norm");
+        ggml_tensor * w = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, inject, 0.25f)), 2.0f);
+        ggml_tensor * c = ggml_dsv4_hc_post(ctx, bo, residual, w, nullptr);
+        ggml_tensor * out = ggml_mul(ctx, ggml_rms_norm(ctx, c, 1e-6f), w_norm);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_topk_moe : public test_case {
     const std::array<int64_t, 4> ne;
     const int n_expert_used;
@@ -10181,6 +10267,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {4, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_DEFAULT,
                 GGML_TYPE_F16, GGML_TYPE_F16));
         }
+    }
+    for (int64_t nt : {1, 2, 4}) {
+        test_cases.emplace_back(new test_gdn_ab(2560, 48, nt));
+        test_cases.emplace_back(new test_gdn_ab(2560, 12, nt));
+        test_cases.emplace_back(new test_hc_up_pre(2560, 320, nt));
+        test_cases.emplace_back(new test_hc_up_pre(96, 128, nt));
+        test_cases.emplace_back(new test_hc_combine_norm(2560, nt));
     }
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true));

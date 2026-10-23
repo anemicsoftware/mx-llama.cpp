@@ -86,6 +86,7 @@ static void ggml_cuda_repack_moe_fusion_count(ggml_type type, int cols) {
 #include "ggml-cuda/gcn-q8-matvec.cuh"
 #include "ggml-cuda/gcn-f16-matvec.cuh"
 #include "ggml-cuda/mm-tile-f.cuh"
+#include "ggml-cuda/hc-dec.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -5194,6 +5195,79 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const int n_step = ggml_cuda_try_fuse_hc_step(cuda_ctx, cgraph, i);
         if (n_step > 0) {
             return n_step;
+        }
+    }
+
+    // decode HC up projection: SCALE -> SILU -> MUL_MAT -> RESHAPE -> gated DSV4_HC_PRE in one kernel (GCN)
+    if (node->op == GGML_OP_SCALE && i + 4 < cgraph->n_nodes &&
+            cgraph->nodes[i + 1]->op == GGML_OP_UNARY && ggml_get_unary_op(cgraph->nodes[i + 1]) == GGML_UNARY_OP_SILU &&
+            cgraph->nodes[i + 1]->src[0] == node && cgraph->nodes[i + 2]->op == GGML_OP_MUL_MAT &&
+            !ggml_cuda_repack_mul_mat_should_fire(cgraph->nodes[i + 2]->src[0]) &&
+            cgraph->nodes[i + 3]->op == GGML_OP_RESHAPE && cgraph->nodes[i + 3]->src[0] == cgraph->nodes[i + 2] &&
+            cgraph->nodes[i + 4]->op == GGML_OP_DSV4_HC_PRE && cgraph->nodes[i + 4]->src[1] == cgraph->nodes[i + 3] &&
+            ggml_cuda_hc_up_pre_dec_supported(ggml_cuda_info().devices[cuda_ctx->device].cc, node, cgraph->nodes[i + 1],
+                                              cgraph->nodes[i + 2], cgraph->nodes[i + 4]) &&
+            ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_DSV4_HC_PRE },
+                                   { i + 4 })) {
+        ggml_cuda_hc_up_pre_dec(*cuda_ctx, node, cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
+        return 4;
+    }
+
+    // shared-expert gate tail: MUL_MAT(1 row) -> SIGMOID -> MUL -> ADD
+    if (node->op == GGML_OP_MUL_MAT && i + 3 < cgraph->n_nodes && node->src[0]->ne[1] == 1 &&
+            !ggml_cuda_repack_mul_mat_should_fire(node->src[0]) &&
+            cgraph->nodes[i + 1]->op == GGML_OP_UNARY && ggml_get_unary_op(cgraph->nodes[i + 1]) == GGML_UNARY_OP_SIGMOID &&
+            cgraph->nodes[i + 2]->op == GGML_OP_MUL && cgraph->nodes[i + 3]->op == GGML_OP_ADD &&
+            ggml_cuda_shexp_gate_add_supported(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3]) &&
+            ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD }, { i + 3 })) {
+        ggml_cuda_shexp_gate_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3]);
+        return 3;
+    }
+
+    // decode GDN gates: MUL_MAT(alpha) -> RESHAPE -> ADD -> SOFTPLUS -> MUL -> RESHAPE and MUL_MAT(beta) -> RESHAPE -> SIGMOID
+    if (node->op == GGML_OP_MUL_MAT && i + 8 < cgraph->n_nodes && cgraph->nodes[i + 3]->op == GGML_OP_UNARY &&
+            cgraph->nodes[i + 8]->op == GGML_OP_UNARY && !ggml_cuda_repack_mul_mat_should_fire(node->src[0]) &&
+            !ggml_cuda_repack_mul_mat_should_fire(cgraph->nodes[i + 6]->src[0]) &&
+            ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL,
+                                   GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_UNARY }, { i + 5, i + 8 }) &&
+            ggml_cuda_gdn_ab_dec_supported(ggml_cuda_info().devices[cuda_ctx->device].cc, node, cgraph->nodes[i + 2],
+                cgraph->nodes[i + 3], cgraph->nodes[i + 4], cgraph->nodes[i + 6], cgraph->nodes[i + 8])) {
+        ggml_cuda_gdn_ab_dec(*cuda_ctx, node, cgraph->nodes[i + 2], cgraph->nodes[i + 6], cgraph->nodes[i + 4], cgraph->nodes[i + 8]);
+        return 8;
+    }
+
+    // HC inject logits -> SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST: the combine computes its stream weights
+    // ps2*sigmoid(ps1*x) itself (GGML_HC_NO_RAWPOST=1 off)
+    if (node->op == GGML_OP_SCALE && i + 3 < cgraph->n_nodes &&
+            cgraph->nodes[i + 1]->op == GGML_OP_UNARY && ggml_get_unary_op(cgraph->nodes[i + 1]) == GGML_UNARY_OP_SIGMOID &&
+            cgraph->nodes[i + 1]->src[0] == node && cgraph->nodes[i + 2]->op == GGML_OP_SCALE &&
+            cgraph->nodes[i + 2]->src[0] == cgraph->nodes[i + 1] && cgraph->nodes[i + 3]->op == GGML_OP_DSV4_HC_POST &&
+            cgraph->nodes[i + 3]->src[2] == cgraph->nodes[i + 2] && cgraph->nodes[i + 3]->src[3] == nullptr &&
+            ggml_get_op_params_f32(node, 1) == 0.0f && ggml_get_op_params_f32(cgraph->nodes[i + 2], 1) == 0.0f &&
+            node->src[0]->type == GGML_TYPE_F32 && ggml_are_same_shape(node->src[0], cgraph->nodes[i + 2])) {
+        static const bool no_rawpost = [] { const char * e = getenv("GGML_HC_NO_RAWPOST"); return e && atoi(e) != 0; }();
+        if (!no_rawpost &&
+                ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST }, { i + 3 })) {
+            ggml_cuda_op_dsv4_hc_post_rawpost(*cuda_ctx, cgraph->nodes[i + 3], node->src[0],
+                ggml_get_op_params_f32(node, 0), ggml_get_op_params_f32(cgraph->nodes[i + 2], 0));
+            return 3;
+        }
+    }
+
+    // RMS_NORM -> SCALE and SCALE -> SILU pairs (per-head q/k norms, the HC low-rank path): one kernel each
+    // (GGML_CUDA_NO_SMALL_FUSIONS=1 off)
+    static const bool no_small_fusions = [] { const char * e = getenv("GGML_CUDA_NO_SMALL_FUSIONS"); return e && atoi(e) != 0; }();
+    if (!no_small_fusions && i + 1 < cgraph->n_nodes) {
+        ggml_tensor * nx = cgraph->nodes[i + 1];
+        if (node->op == GGML_OP_RMS_NORM && nx->op == GGML_OP_SCALE && nx->src[0] == node &&
+                ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, { i + 1 }) &&
+                ggml_cuda_rms_norm_scale_narrow(*cuda_ctx, node, nx)) {
+            return 1;
+        }
+        if (node->op == GGML_OP_SCALE && nx->op == GGML_OP_UNARY && ggml_get_unary_op(nx) == GGML_UNARY_OP_SILU &&
+                nx->src[0] == node && ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY }, { i + 1 }) &&
+                ggml_cuda_scale_silu(*cuda_ctx, node, nx)) {
+            return 1;
         }
     }
 
