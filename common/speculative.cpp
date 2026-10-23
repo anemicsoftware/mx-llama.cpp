@@ -1031,6 +1031,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     int32_t     block_size    = 0;
     llama_token mask_token_id = 0;
 
+    bool    is_lilicorr    = false;
+    int32_t lilicorr_top_k = 0;
+    size_t lilicorr_rows = 0;
+    std::vector<float> lilicorr_embd;
+    std::vector<llama_pos> lilicorr_pos;
+
     bool    is_dflash2     = false;
     bool    is_mrope       = false;
     int32_t selector_top_k = 0;
@@ -1099,6 +1105,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         selector_top_k = llama_model_dflash_selector_top_k(model_dft);
         is_dflash2     = selector_top_k > 0;
+        char lilicorr_meta[32] = {};
+        lilicorr_top_k = llama_model_meta_val_str(model_dft, "lilicorr.candidate_topk", lilicorr_meta, sizeof(lilicorr_meta)) >= 0
+                ? std::atoi(lilicorr_meta) : 0;
+        is_lilicorr = lilicorr_top_k > 0;
+        if (is_lilicorr) {
+            lilicorr_rows = (size_t) block_size + 1;
+            const size_t lilicorr_slots = (size_t) n_seq * lilicorr_rows;
+            lilicorr_embd.resize(lilicorr_slots * (size_t) n_embd_dec);
+            lilicorr_pos.assign(lilicorr_slots, -1);
+        }
         // A sidecar drafter can be converted with tokenizer.ggml.model = no_vocab, and then
         // its token list is empty, so llama_vocab rejects every special token id the GGUF
         // declares as out of range and hands back LLAMA_TOKEN_NULL. The drafter shares the
@@ -1159,7 +1175,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         // offload draft sampling to the backend
         backend_chains.assign(n_seq, nullptr);
-        if (this->params.backend_sampling && !is_dflash2) {
+        if (this->params.backend_sampling && !is_dflash2 && !is_lilicorr) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
                 llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
@@ -1180,7 +1196,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
-        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2);
+        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2 && !is_lilicorr);
         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
         // pay the flagged scheduler re-reserve now - inside the first decode it
         // lands in the measured prompt processing time
@@ -1195,7 +1211,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // eager per-chunk path.
         {
             const char * s = getenv("LLAMA_DFLASH_DEFER");
-            const bool want = s == nullptr || atoi(s) != 0;
+            // LiliCorr stores the projected rows of each inject, which only the eager path does
+            const bool want = (s == nullptr || atoi(s) != 0) && !is_lilicorr;
             if (want) {
                 accum_enabled = llama_set_embeddings_layer_inp_accum(
                     ctx_tgt, (int32_t) llama_n_ctx_seq(ctx_tgt)) != nullptr;
@@ -1574,6 +1591,24 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                             __func__, rc, (int) n_chunk, (int) offset);
                     return false;
                 }
+                if (is_lilicorr) {
+                    // Ordinary DFlash can write to the KV cache, but LiliCorr needs to store embeddings across sequences.
+                    const float * projected = llama_get_embeddings_nextn(ctx_dft);
+                    if (projected) {
+                        const size_t seq_offset = (size_t) seq_id * lilicorr_rows;
+                        const llama_pos pos_min = std::max(0, batch_inject.tokens.back().pos[0] - block_size);
+                        for (int32_t i = 0; i < n_chunk; ++i) {
+                            const llama_pos pos = batch_inject.tokens[i].pos[0];
+                            if (pos < pos_min) {
+                                continue;
+                            }
+                            const size_t slot = seq_offset + (size_t) pos % lilicorr_rows;
+                            std::memcpy(lilicorr_embd.data() + slot * (size_t) n_embd_dec,
+                                    projected + (size_t) i * n_embd_dec, (size_t) n_embd_dec * sizeof(float));
+                            lilicorr_pos[slot] = pos;
+                        }
+                    }
+                }
             }
         }
 
@@ -1617,12 +1652,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             const int32_t n = (int32_t) dp.pos0;
 
             const int32_t n_draft = params.n_max;
-
-            const int32_t n_block_tokens = n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
+            const int32_t n_block_tokens = is_lilicorr ? block_size : n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
-                batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, !is_dflash2);
+                const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, !is_dflash2 && !is_lilicorr);
+                if (is_lilicorr) {
+                    // For LiliCorr drafting batch, set state embeddings for use in the associated transformer head.
+                    const llama_pos pos = dp.pos0 - 1;
+                    const size_t slot = (size_t) seq_id * lilicorr_rows + (size_t) pos % lilicorr_rows;
+                    batch.set_embd_state(idx, { lilicorr_embd.data() + slot * (size_t) n_embd_dec, 1, (size_t) n_embd_dec });
+                }
             }
         }
 
@@ -1650,21 +1690,23 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             auto & result = *dp.result;
 
-            if (is_dflash2) {
+            if (is_dflash2 || is_lilicorr) {
+                // Both DFlash and LiliCorr greedily walk the candidate lattice.
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
 
                 int32_t predecessor = 0;
-                for (int32_t i = 1; i < n_block_tokens; ++i) {
+                for (int32_t i = 1; i < (is_dflash2 ? n_block_tokens : params.n_max + 1); ++i) {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
-                    const float * scores = row + selector_top_k + (size_t) predecessor * selector_top_k;
+                    const int32_t top_k = is_dflash2 ? selector_top_k : lilicorr_top_k;
+                    const float * scores = row + top_k + (size_t) predecessor * top_k;
 
                     predecessor = (int32_t) std::distance(scores,
-                            std::max_element(scores, scores + selector_top_k));
+                            std::max_element(scores, scores + top_k));
                     if (params.p_min > 0.0f) {
                         // softmax(scores) at the argmax, i.e. 1 / sum(exp(s_k - s_max))
                         float sum = 0.0f;
-                        for (int32_t k = 0; k < selector_top_k; ++k) {
+                        for (int32_t k = 0; k < top_k; ++k) {
                             sum += std::exp(scores[k] - scores[predecessor]);
                         }
                         if (1.0f / sum < params.p_min) {
@@ -3157,6 +3199,10 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.cache_type_v  = params_spec.cache_type_v;
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
+
+    if (params_spec.n_ubatch > 0) {
+        result.n_ubatch = params_spec.n_ubatch;
+    }
 
     // the MoE cache is only used by the target context
     result.moe_cache_size = 0;
