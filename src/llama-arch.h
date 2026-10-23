@@ -826,6 +826,7 @@ struct LLM_KV {
 
     llm_arch arch;
     const char * suffix;
+    std::string prefix; // key prefix when the GGUF uses an alias of the arch name
 
     std::string operator()(llm_kv kv) const;
 };

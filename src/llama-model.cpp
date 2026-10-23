@@ -2036,7 +2036,8 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
 }
 
 void llama_model_base::load_vocab(llama_model_loader & ml) {
-    const auto kv = LLM_KV(arch);
+    auto kv = LLM_KV(arch);
+    kv.prefix = ml.llm_kv.prefix;
 
     vocab.load(ml, kv);
 }
