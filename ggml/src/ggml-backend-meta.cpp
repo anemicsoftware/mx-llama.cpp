@@ -223,6 +223,29 @@ static ggml_backend_buffer_type_t * ggml_backend_meta_device_get_extra_bufts(ggm
 
 static bool ggml_backend_meta_buft_is_repack(ggml_backend_buffer_type_t buft);
 
+// GGML_CUDA_REPACK_TYPES=q8_0,mxfp4,...: the weight types the CUDA repack buffer takes (default q8_0,mxfp4,iq4_nl, see
+// ggml_cuda_repack_tensor_supported)
+static bool ggml_backend_meta_repack_type_enabled(ggml_type type) {
+    static const std::vector<bool> enabled = [] {
+        std::vector<bool> e(GGML_TYPE_COUNT, false);
+        const char * env = getenv("GGML_CUDA_REPACK_TYPES");
+        const std::string list = env ? env : "q8_0,mxfp4,iq4_nl";
+        size_t pos = 0;
+        while (pos <= list.size()) {
+            const size_t c = std::min(list.find(',', pos), list.size());
+            const std::string name = list.substr(pos, c - pos);
+            for (int t = 0; t < GGML_TYPE_COUNT; t++) {
+                if (name == ggml_type_name((ggml_type) t)) {
+                    e[t] = true;
+                }
+            }
+            pos = c + 1;
+        }
+        return e;
+    }();
+    return type < GGML_TYPE_COUNT && enabled[type];
+}
+
 static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
@@ -255,6 +278,7 @@ static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const g
             default:
                 return false;
         }
+        if (!ggml_backend_meta_repack_type_enabled(w->type)) return false;
         if (op->src[1] == nullptr || op->src[1]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) return false;
 
         // Buffer-independent repackability: enforced here during buft selection so the

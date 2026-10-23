@@ -6,12 +6,42 @@
 #include <cstdlib>
 
 #include <cstring>
+#include <string>
+#include <vector>
+#include <algorithm>
 #include <map>
 #include <mutex>
+
+// GGML_CUDA_REPACK_TYPES=q8_0,mxfp4,...: repack only these weight types. The K-quants and q5_1 default to the
+// canonical layout, where the GCN kernels beat the repacked ones (GLM-5.3 and Flash-Next pp and tg)
+static bool repack_type_enabled(ggml_type type) {
+    static const std::vector<bool> enabled = [] {
+        std::vector<bool> e(GGML_TYPE_COUNT, false);
+        const char * env = getenv("GGML_CUDA_REPACK_TYPES");
+        const std::string list = env ? env : "q8_0,mxfp4,iq4_nl";
+        size_t pos = 0;
+        while (pos <= list.size()) {
+            const size_t c = std::min(list.find(',', pos), list.size());
+            const std::string name = list.substr(pos, c - pos);
+            for (int t = 0; t < GGML_TYPE_COUNT; t++) {
+                const char * tn = ggml_type_name((ggml_type) t);
+                if (tn != nullptr && name == tn) {
+                    e[t] = true;
+                }
+            }
+            pos = c + 1;
+        }
+        return e;
+    }();
+    return type < GGML_TYPE_COUNT && enabled[type];
+}
 
 bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
     // Views are never in repacked layout (the scale-plane offset needs the FULL ne1).
     if (t->view_src != nullptr) return false;
+    if (!repack_type_enabled(t->type)) {
+        return false;
+    }
     if ((ggml_n_dims(t) != 2 && ggml_n_dims(t) != 3) || !ggml_is_contiguous(t)) {
         return false;
     }
