@@ -5580,6 +5580,34 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
+            const int cc_g = ggml_cuda_info().devices[cuda_ctx->device].cc;
+            const bool swiglu_ok = ggml_get_op_params_i32(glu, 1) == 0 &&
+                (ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU || ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU_CLAMP);
+            const float swiglu_limit = ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU_CLAMP ? ggml_get_op_params_f32(glu, 3) : INFINITY;
+
+            // GCN prefill MoE gate/up + SwiGLU(-clamp) on the expert-grouped GEMM: one preparation, the up launch applies
+            // the GLU to the gate projection the first launch wrote into glu
+            if (swiglu_ok && gate->op == GGML_OP_MUL_MAT_ID && up->op == GGML_OP_MUL_MAT_ID && glu->src[0] == gate &&
+                    glu->src[1] == up && gate->src[1] == up->src[1] && gate->src[2] == up->src[2] &&
+                    ggml_are_same_shape(gate->src[0], up->src[0]) && ggml_are_same_shape(gate, glu) && ggml_is_contiguous(glu) &&
+                    !ggml_cuda_repack_mul_mat_should_fire(gate->src[0]) && !ggml_cuda_repack_mul_mat_should_fire(up->src[0]) &&
+                    ggml_cuda_gcn_kq_moe_supported(cc_g, gate->src[0], gate->src[1], gate->src[2], glu) &&
+                    ggml_cuda_gcn_kq_moe_supported(cc_g, up->src[0], up->src[1], up->src[2], glu)) {
+                ggml_cuda_gcn_kq_moe(*cuda_ctx, gate->src[0], gate->src[1], gate->src[2], glu, up->src[0], swiglu_limit);
+                fused_mul_mat_vec = true;
+                fused_node_count  = 3;
+                break;
+            }
+
+            // GCN row-lane MoE: gate/up + SwiGLU share one preparation and the up kernel applies SwiGLU
+            if (!ggml_cuda_repack_mul_mat_should_fire(gate->src[0]) && !ggml_cuda_repack_mul_mat_should_fire(up->src[0]) &&
+                    ggml_cuda_moe_vec_pair_supported(cc_g, gate, up, glu)) {
+                ggml_cuda_moe_vec_pair(*cuda_ctx, gate, up, glu);
+                fused_mul_mat_vec = true;
+                fused_node_count  = 3;
+                break;
+            }
+
             if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate->src[0];
@@ -5587,6 +5615,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
 
                 ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                fused_mul_mat_vec = true;
+                fused_node_count  = 3;
+                break;
+            }
+
+            // GCN, 1-2 tokens, dense q4_K / q5_K gate/up + SwiGLU(-clamp) (GGML_CUDA_GCN_KQ_MV1)
+            if (swiglu_ok && ids == nullptr && up->op == GGML_OP_MUL_MAT && gate->op == GGML_OP_MUL_MAT && glu->src[0] == gate &&
+                    glu->src[1] == up && gate->src[1] == src1 && !ggml_cuda_repack_mul_mat_should_fire(src0) &&
+                    !ggml_cuda_repack_mul_mat_should_fire(gate->src[0]) &&
+                    ggml_cuda_gcn_kq_matvec_glu(*cuda_ctx, src0, gate->src[0], src1, glu, swiglu_limit)) {
                 fused_mul_mat_vec = true;
                 fused_node_count  = 3;
                 break;

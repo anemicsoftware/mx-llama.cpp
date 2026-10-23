@@ -5539,6 +5539,69 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// routed-expert FFN at decode / MTP verify sizes: MUL_MAT_ID gate/up -> SWIGLU_CLAMP -> MUL_MAT_ID down (the CUDA
+// backend fuses the gate/up pair on GCN; GLM-5.3-Flash UD-Q2_K_XL: iq2_xs gate/up, iq3_xxs down)
+struct test_moe_glu_pair : public test_case {
+    const ggml_type type_gu, type_d;
+    const int64_t k, m, n_out, n_tok;
+    const int n_mats, n_used;
+    const float limit;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_GLU_PAIR";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR9(type_gu, type_d, k, m, n_out, n_tok, n_mats, n_used, limit);
+    }
+
+    bool run_whole_graph() override {
+        return true;
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * n_tok * n_used * (2 * k * m + m * n_out);
+    }
+
+    test_moe_glu_pair(ggml_type type_gu = GGML_TYPE_IQ2_XS, ggml_type type_d = GGML_TYPE_IQ3_XXS, int64_t k = 4096,
+            int64_t m = 512, int64_t n_out = 4096, int64_t n_tok = 1, int n_mats = 288, int n_used = 8, float limit = 10.0f)
+        : type_gu(type_gu), type_d(type_d), k(k), m(m), n_out(n_out), n_tok(n_tok), n_mats(n_mats), n_used(n_used), limit(limit) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate_exps = ggml_new_tensor_3d(ctx, type_gu, k, m, n_mats);
+        ggml_tensor * up_exps   = ggml_new_tensor_3d(ctx, type_gu, k, m, n_mats);
+        ggml_tensor * down_exps = ggml_new_tensor_3d(ctx, type_d,  m, n_out, n_mats);
+        ggml_set_name(gate_exps, "gate_exps");
+        ggml_set_name(up_exps,   "up_exps");
+        ggml_set_name(down_exps, "down_exps");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n_tok);
+        ggml_set_name(ids, "ids");
+        ids = ggml_view_2d(ctx, ids, n_used, n_tok, ids->nb[1], 0);
+
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, n_tok);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * g   = ggml_mul_mat_id(ctx, gate_exps, x, ids);
+        ggml_tensor * u   = ggml_mul_mat_id(ctx, up_exps,   x, ids);
+        ggml_tensor * h   = ggml_swiglu_clamp(ctx, g, u, limit);
+        ggml_tensor * out = ggml_mul_mat_id(ctx, down_exps, h, ids);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+};
+
+
 // MUL_MAT_ID with expert ids repeated within a token's row
 struct test_mul_mat_id_dup : public test_mul_mat_id {
     using test_mul_mat_id::test_mul_mat_id;
@@ -9756,6 +9819,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XS,  GGML_TYPE_F32, 16, 4, true,  72, 3, 768));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 16, 4, false, 40, 2, 256));
+    for (int64_t nt : {1, 2, 3, 4}) {
+        test_cases.emplace_back(new test_moe_glu_pair(GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS, 4096, 512, 4096, nt));
+        test_cases.emplace_back(new test_moe_glu_pair(GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_K, 4096, 512, 4096, nt, 256, 6));
+    }
+    test_cases.emplace_back(new test_moe_glu_pair(GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_XS, 512, 256, 300, 3, 16, 4));
+    test_cases.emplace_back(new test_moe_glu_pair(GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS, 1024, 256, 72, 1, 16, 6, INFINITY));
+    // the K-quant pairs at prefill (expert-grouped GEMM) and on the row-lane tiles
+    test_cases.emplace_back(new test_moe_glu_pair(GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, 2048, 512, 2048, 512, 64, 8));
+    test_cases.emplace_back(new test_moe_glu_pair(GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, 2048, 512, 2048, 48, 64, 8));
+    test_cases.emplace_back(new test_moe_glu_pair(GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS, 4096, 512, 4096, 256));
     // q5_1 MoE down projection with K % 128 != 0 (a 320-wide expert slice under -sm tensor): row-lane K tail
     for (int n : {1, 4, 96, 320}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_1, GGML_TYPE_F32, 128, 8, false, 2560, n, 320));
