@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "mmq.cuh"
+#include "gcn-q8-gemm.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
 
@@ -187,6 +188,13 @@ void ggml_cuda_mul_mat_q(
     const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
 
+    if (!ids && ggml_cuda_gcn_q8_gemm(ctx, src0, src1, dst)) {
+        return;
+    }
+    if (!ids && ggml_cuda_gcn_kq_gemm(ctx, src0, src1, dst)) {
+        return;
+    }
+
     int J_best        = 0;
     int nthreads_best = 0;
     {
@@ -197,7 +205,14 @@ void ggml_cuda_mul_mat_q(
 
             // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
             // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
-            if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
+            // GCN also wins with it for long K (gate/up), not for a short K down projection. GGML_MMQ_MOE_NCOLS_AVG=0/1 forces it.
+            static const int moe_ncols_avg_env = [] {
+                const char * s = getenv("GGML_MMQ_MOE_NCOLS_AVG");
+                return s ? atoi(s) : -1;
+            }();
+            const bool moe_ncols_avg = moe_ncols_avg_env >= 0 ? moe_ncols_avg_env != 0 :
+                (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc) || (GGML_CUDA_CC_IS_GCN(cc) && ne00 >= 2048));
+            if (moe_ncols_avg) {
                 ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
             }
         }
@@ -437,7 +452,7 @@ void ggml_cuda_mul_mat_q(
 
         ggml_cuda_launch_mm_ids_helper(ids_chunk, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
             ne02, iter_ne12, n_expert_used, ne11, ids_s1, src1_ids_s1,
-            /*write_inverse =*/ dedup_bcast, stream);
+            /*write_inverse =*/ dedup_bcast, stream, &ctx.pool());
         CUDA_CHECK(cudaGetLastError());
 
         if (use_native_fp4) {

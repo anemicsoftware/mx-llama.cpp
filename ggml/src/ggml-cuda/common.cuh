@@ -1616,6 +1616,19 @@ struct ggml_backend_cuda_context {
         q8_1_cache.clear();
     }
 
+    // F32 graph tensors whose producer stored them as F16 in place because every consumer reads F16; reset for every
+    // graph evaluation. ld: F16 row stride in halves (0 = compact, rows of ne[0] halves).
+    struct f16_inplace_entry { const ggml_tensor * t; int64_t ld; };
+    std::vector<f16_inplace_entry> f16_inplace;
+    std::vector<const ggml_tensor *> early_done; // nodes computed early by a fused launch (multi-matrix gemv1)
+
+    // arrival counters of fused kernels (zero between launches), allocated on first use
+    int * hc_mix_counters   = nullptr; // DSV4_HC_MIX per token
+    int * hc_step_gen       = nullptr; // dsv4_hc_step_f32 grid barrier generations (per token)
+    int * router1_counter   = nullptr; // ggml_cuda_router1_topk
+    int * moe1_counters     = nullptr; // moe1_down3_q3k per row block
+    int * gemv1_epi_counter = nullptr; // multi-matrix gemv1 epilogue
+
     ~ggml_backend_cuda_context();
 
     cudaStream_t stream(int device, int stream) {
@@ -1820,6 +1833,31 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
 
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
+}
+
+static inline const ggml_tensor * ggml_cuda_view_base(const ggml_tensor * t) {
+    while (t->view_src) {
+        t = t->view_src;
+    }
+    return t;
+}
+
+// F16 row stride (halves) of a tensor stored as F16 in place, 0 if it is not (row length k for compact storage)
+static inline int64_t ggml_cuda_f16_inplace_ld(const ggml_backend_cuda_context & ctx, const ggml_tensor * t, const int64_t k) {
+    if (ctx.f16_inplace.empty()) {
+        return 0;
+    }
+    const ggml_tensor * b = ggml_cuda_view_base(t);
+    for (const auto & e : ctx.f16_inplace) {
+        if (e.t == b) {
+            return e.ld ? e.ld : k;
+        }
+    }
+    return 0;
+}
+
+static inline bool ggml_cuda_is_f16_inplace(const ggml_backend_cuda_context & ctx, const ggml_tensor * t) {
+    return ggml_cuda_f16_inplace_ld(ctx, t, 1) != 0;
 }
 
 // Defined in ggml-cuda.cu. Hands back the quantized copy of src1 made earlier in

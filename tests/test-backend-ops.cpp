@@ -9733,6 +9733,81 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17));
     test_cases.emplace_back(new test_dsv4_hc_post(128, 257));
+    // GCN MoE kernels (moe-vec.cu, gcn-q8-gemm.cu): GLM-5.3-Flash UD-Q2_K_XL decode / MTP verify at TP4 shapes
+    for (int64_t nt : {1, 2, 3, 4}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XS,  GGML_TYPE_F32, 288, 8, true,  512,  nt, 4096));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 288, 8, false, 4096, nt, 512));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_XS,  GGML_TYPE_F32, 288, 8, false, 4096, nt, 512));
+    }
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 16, 4, false, 40, 3, 768));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 16, 4, true,  72, 2, 256));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 256, 6, true,  512,  512, 4096));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_K,    GGML_TYPE_F32, 256, 6, false, 4096, 512, 512));
+    for (int64_t nt : {1, 2, 3, 4, 6}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 256, 6, true, 512, nt, 4096));
+    }
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 16, 4, true, 72, 3, 768));
+    // small batches on the per-slot i-quant kernel (up to 64 tokens, iq2_xxs 32) and just past it
+    for (ggml_type t : {GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ2_XXS}) {
+        for (int64_t nt : {16, 33, 64, 65}) {
+            test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 64, 8, true,  256, nt, 1024));
+            test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 64, 8, false, 1024, nt, 256));
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XS,  GGML_TYPE_F32, 16, 4, true,  72, 3, 768));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 16, 4, false, 40, 2, 256));
+    // q5_1 MoE down projection with K % 128 != 0 (a 320-wide expert slice under -sm tensor): row-lane K tail
+    for (int n : {1, 4, 96, 320}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_1, GGML_TYPE_F32, 128, 8, false, 2560, n, 320));
+    }
+    // row-lane and expert-grouped MoE kernels: the model's expert types at ~8 and ~64 tokens per expert
+    for (ggml_type t : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+        const bool kq = t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K || t == GGML_TYPE_Q6_K;
+        test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 128, 8, kq, kq ? 640 : 2560, 96, kq ? 2560 : 640));
+        test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 64, 8, kq, 512, 512, 2048));
+    }
+    // GCN dense q8_0 GEMM (>= 2048 rows, K % 128 == 0), incl. partial token tiles
+    for (int nt : {33, 100, 384}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2560, nt, 2560, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, nt, 1024, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2560, nt, 320,  {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2048, nt, 96,   {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 640,  nt, 2560, {1, 1}, {1, 1}));
+    }
+    // GCN dense q8_0 matvec at 5..16 tokens (>= 4096 rows); 4 tokens (MMVQ) for contrast
+    for (int nt : {4, 5, 6, 8, 11, 16}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, nt, 1024, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, nt, 2048, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, nt, 512,  {1, 1}, {1, 1}));
+    }
+    // GCN K-quant matvec (1..4 tokens), its q5_K / iq4_xs MMVQ column slices (9..16 tokens) and the K-quant GEMM
+    for (ggml_type t : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL}) {
+        for (int n : {1, 2, 3, 4, 9, 12, 16, 20, 32, 33, 100, 384}) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 256, n, 4096, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 2048, n, 1024, {1, 1}, {1, 1}));
+        }
+    }
+    // GCN dense q2_K / q3_K row-lane at 2..16 tokens, F16 matvec at 1..8 and F32 matvec at 1..4 tokens
+    for (ggml_type t : {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K}) {
+        for (int n : {2, 5, 16}) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 1024, n, 2048, {1, 1}, {1, 1}));
+        }
+    }
+    for (int n : {1, 2, 3, 4, 5, 8}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1024, n, 4096, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 333,  n, 256,  {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 288,  n, 4096, {1, 1}, {1, 1}));
+    }
+    // GCN register-tiled F32/BF16 small-M path (mm-tile-f.cu): ragged rows/tokens, both K strides
+    for (ggml_type ta : {GGML_TYPE_F32, GGML_TYPE_BF16}) {
+        for (int m : {2, 3, 5, 24, 64}) {
+            for (int n : {9, 100, 333}) {
+                for (int k : {1024, 260}) {
+                    test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+                }
+            }
+        }
+    }
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21, true));

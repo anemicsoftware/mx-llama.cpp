@@ -80,6 +80,12 @@ static void ggml_cuda_repack_moe_fusion_count(ggml_type type, int cols) {
 }
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/moe-vec.cuh"
+#include "ggml-cuda/gcn-q8-gemm.cuh"
+#include "ggml-cuda/gcn-kq-matvec.cuh"
+#include "ggml-cuda/gcn-q8-matvec.cuh"
+#include "ggml-cuda/gcn-f16-matvec.cuh"
+#include "ggml-cuda/mm-tile-f.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -831,6 +837,11 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
+    }
+    for (int * p : { hc_mix_counters, hc_step_gen, router1_counter, moe1_counters, gemv1_epi_counter }) {
+        if (p != nullptr) {
+            (void) cudaFree(p);
+        }
     }
     if (pp_copy_event_a != nullptr) {
         CUDA_CHECK(cudaEventDestroy(pp_copy_event_a));
@@ -2900,6 +2911,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
 
+    if (ggml_cuda_mm_tile_f_supported(src0, src1, dst, ggml_cuda_info().devices[ctx.device].cc)) {
+        ggml_cuda_mm_tile_f(ctx, src0, src1, dst);
+        return;
+    }
+
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
     // Therefore, in such cases use cuBLAS.
@@ -2918,6 +2934,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
+    // GCN: F16 weights at 1..8 tokens and F32 weights (routers) at 1..4 tokens
+    if (ggml_cuda_gcn_f16_matvec(ctx, src0, src1, dst)) {
+        return;
+    }
+    if (ggml_cuda_gcn_f32_matvec(ctx, src0, src1, dst)) {
+        return;
+    }
     if (ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
@@ -2942,8 +2965,39 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
+    // GCN: q8_0 at a few tokens (MTP verify), q2_K / q3_K at 2..16 tokens, q4_K / q5_K / q6_K / iq4_xs at 1..4 tokens
+    if (ggml_cuda_gcn_q8_matvec(ctx, src0, src1, dst)) {
+        return;
+    }
+    if (ggml_cuda_rowlane_dense_supported(cc, src0, src1, dst)) {
+        ggml_cuda_rowlane_dense(ctx, src0, src1, dst);
+        return;
+    }
+    if (ggml_cuda_gcn_kq_matvec_supported(cc, src0, src1, dst)) {
+        ggml_cuda_gcn_kq_matvec(ctx, src0, src1, dst);
+        return;
+    }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    // GCN, 9..16 tokens of q5_K / iq4_xs: MMVQ over column slices of <= 8 beats MMQ (GGML_CUDA_GCN_MMVQ_SPLIT=0: off)
+    static const int gcn_mmvq_split = [] { const char * e = getenv("GGML_CUDA_GCN_MMVQ_SPLIT"); return e ? atoi(e) : 1; }();
+    if (gcn_mmvq_split && GGML_CUDA_CC_IS_GCN(cc) && ne11 > MMVQ_MAX_BATCH_SIZE && ne11 <= 2*MMVQ_MAX_BATCH_SIZE &&
+            (src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_IQ4_XS) && ne12 == 1 && ne13 == 1 &&
+            src0->ne[2] == 1 && src0->ne[3] == 1 && ggml_cuda_should_use_mmvq(src0->type, cc, MMVQ_MAX_BATCH_SIZE)) {
+        ggml_tensor s1 = *src1;
+        ggml_tensor d  = *dst;
+        ggml_cuda_q8_cache_bypass = true; // the q8_1 activation cache is keyed by the tensor pointer, &s1 is reused
+        for (int64_t c0 = 0; c0 < ne11; c0 += MMVQ_MAX_BATCH_SIZE) {
+            const int64_t nc = std::min<int64_t>(MMVQ_MAX_BATCH_SIZE, ne11 - c0);
+            s1.ne[1] = nc;
+            s1.data  = (char *) src1->data + c0*src1->nb[1];
+            d.ne[1]  = nc;
+            d.data   = (char *) dst->data + c0*dst->nb[1];
+            ggml_cuda_mul_mat_vec_q(ctx, src0, &s1, nullptr, &d);
+        }
+        ggml_cuda_q8_cache_bypass = false;
         return;
     }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
@@ -3004,6 +3058,16 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
+        // GCN decode: the K-split row-lane kernel beats MMVQ (short K rows leave most MMVQ lanes idle)
+        if (ggml_cuda_moe_vec_decode_supported(cc, src0, src1, ids, dst)) {
+            ggml_cuda_moe_vec(ctx, src0, src1, ids, dst);
+            return;
+        }
+        // q3_K / q2_K experts: the row-lane tiles beat MMVQ from the token count their threshold allows
+        if ((src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_Q2_K) && ggml_cuda_moe_vec_supported(cc, src0, src1, ids, dst)) {
+            ggml_cuda_moe_vec(ctx, src0, src1, ids, dst);
+            return;
+        }
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
@@ -3017,6 +3081,16 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                     return;
                 }
             }
+        }
+
+        // prefill on GCN: K-quant experts grouped by expert on the GEMM tiles, i-quant experts on the row-lane tiles
+        if (ggml_cuda_gcn_kq_moe_supported(cc, src0, src1, ids, dst)) {
+            ggml_cuda_gcn_kq_moe(ctx, src0, src1, ids, dst);
+            return;
+        }
+        if (ggml_cuda_moe_vec_supported(cc, src0, src1, ids, dst)) {
+            ggml_cuda_moe_vec(ctx, src0, src1, ids, dst);
+            return;
         }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
