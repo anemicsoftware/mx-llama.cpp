@@ -1262,7 +1262,6 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         // Do not re-add it. LFM2/LFM2MOE were dropped from this list by upstream.
         case LLM_ARCH_MINIMAX_01:
         case LLM_ARCH_MINIMAX_M3:
-        case LLM_ARCH_MISTRAL4:
         case LLM_ARCH_KIMI_LINEAR:
         case LLM_ARCH_BAILINGMOE3:
         case LLM_ARCH_KIMI_K3:
@@ -1282,6 +1281,7 @@ bool llm_arch_sm_tensor_replicates_attention(const llm_arch & arch) {
         case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_DEEPSEEK41:
+        case LLM_ARCH_MISTRAL4:
             return true;
         default:
             return false;
