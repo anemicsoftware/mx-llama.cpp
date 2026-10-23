@@ -12,13 +12,13 @@
 #include <map>
 #include <mutex>
 
-// GGML_CUDA_REPACK_TYPES=q8_0,mxfp4,...: repack only these weight types. The K-quants and q5_1 default to the
-// canonical layout, where the GCN kernels beat the repacked ones (GLM-5.3 and Flash-Next pp and tg)
+// GGML_CUDA_REPACK_TYPES=q8_0,mxfp4,...: repack only these weight types. q8_0, the K-quants and q5_1 default to the
+// canonical layout, where the GCN kernels and fusions beat the repacked ones (GLM-5.3 and Flash-Next pp and tg)
 static bool repack_type_enabled(ggml_type type) {
     static const std::vector<bool> enabled = [] {
         std::vector<bool> e(GGML_TYPE_COUNT, false);
         const char * env = getenv("GGML_CUDA_REPACK_TYPES");
-        const std::string list = env ? env : "q8_0,mxfp4,iq4_nl";
+        const std::string list = env ? env : "mxfp4,iq4_nl";
         size_t pos = 0;
         while (pos <= list.size()) {
             const size_t c = std::min(list.find(',', pos), list.size());

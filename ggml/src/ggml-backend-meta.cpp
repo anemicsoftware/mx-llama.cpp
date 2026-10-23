@@ -223,13 +223,13 @@ static ggml_backend_buffer_type_t * ggml_backend_meta_device_get_extra_bufts(ggm
 
 static bool ggml_backend_meta_buft_is_repack(ggml_backend_buffer_type_t buft);
 
-// GGML_CUDA_REPACK_TYPES=q8_0,mxfp4,...: the weight types the CUDA repack buffer takes (default q8_0,mxfp4,iq4_nl, see
+// GGML_CUDA_REPACK_TYPES=q8_0,mxfp4,...: the weight types the CUDA repack buffer takes (default mxfp4,iq4_nl, see
 // ggml_cuda_repack_tensor_supported)
 static bool ggml_backend_meta_repack_type_enabled(ggml_type type) {
     static const std::vector<bool> enabled = [] {
         std::vector<bool> e(GGML_TYPE_COUNT, false);
         const char * env = getenv("GGML_CUDA_REPACK_TYPES");
-        const std::string list = env ? env : "q8_0,mxfp4,iq4_nl";
+        const std::string list = env ? env : "mxfp4,iq4_nl";
         size_t pos = 0;
         while (pos <= list.size()) {
             const size_t c = std::min(list.find(',', pos), list.size());
