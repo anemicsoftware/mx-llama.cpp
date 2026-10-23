@@ -11723,6 +11723,121 @@ void ggml_compute_forward_dsv4_hc_post(
     }
 }
 
+// ggml_compute_forward_dsv4_hc_mix
+
+static void ggml_compute_forward_dsv4_hc_mix_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * x     = dst->src[0];
+    const ggml_tensor * fn    = dst->src[1];
+    const ggml_tensor * scale = dst->src[2];
+    const ggml_tensor * base  = dst->src[3];
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(scale->type == GGML_TYPE_F32 && base->type == GGML_TYPE_F32);
+
+    constexpr int64_t hc    = 4;
+    constexpr int64_t n_mix = (2 + hc)*hc;
+
+    const int64_t n_embd   = x->ne[0];
+    const int64_t n_tokens = x->ne[2];
+    const int64_t K        = n_embd*hc;
+
+    GGML_ASSERT(x->ne[1] == hc && fn->ne[0] == K && fn->ne[1] == n_mix && dst->ne[0] == n_mix);
+
+    const float   eps    = ggml_get_op_params_f32(dst, 0);
+    const float   hc_eps = ggml_get_op_params_f32(dst, 1);
+    const int32_t n_iter = ggml_get_op_params_i32(dst, 2);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t dr  = (n_tokens + nth - 1) / nth;
+    const int64_t it0 = dr * ith;
+    const int64_t it1 = MIN(it0 + dr, n_tokens);
+    if (it0 >= it1) {
+        return;
+    }
+
+    // the weight rows in f32, once per thread
+    std::vector<float> w((size_t) n_mix*K);
+    for (int64_t j = 0; j < n_mix; ++j) {
+        const char * row = (const char *) fn->data + j*fn->nb[1];
+        if (fn->type == GGML_TYPE_F32) {
+            memcpy(w.data() + j*K, row, K*sizeof(float));
+        } else {
+            ggml_get_type_traits(fn->type)->to_float(row, w.data() + j*K, K);
+        }
+    }
+
+    const float * sc = (const float *) scale->data;
+    const float * bs = (const float *) base->data;
+    std::vector<float> xf(K);
+
+    for (int64_t it = it0; it < it1; ++it) {
+        ggml_float ss = 0.0;
+        for (int64_t h = 0; h < hc; ++h) {
+            const float * xr = (const float *) ((const char *) x->data + h*x->nb[1] + it*x->nb[2]);
+            for (int64_t i = 0; i < n_embd; ++i) {
+                xf[h*n_embd + i] = xr[i];
+                ss += (ggml_float) xr[i]*xr[i];
+            }
+        }
+        const float r = 1.0f/sqrtf((float) (ss/K) + eps);
+
+        float mix[n_mix];
+        for (int64_t j = 0; j < n_mix; ++j) {
+            ggml_float d = 0.0;
+            const float * wr = w.data() + j*K;
+            for (int64_t k = 0; k < K; ++k) {
+                d += (ggml_float) wr[k]*xf[k];
+            }
+            mix[j] = r*(float) d;
+        }
+
+        float * out = (float *) ((char *) dst->data + it*dst->nb[1]);
+        for (int64_t h = 0; h < hc; ++h) {
+            out[h]      = 1.0f/(1.0f + expf(-(mix[h]*sc[0] + bs[h]))) + hc_eps;
+            out[hc + h] = 2.0f/(1.0f + expf(-(mix[hc + h]*sc[1] + bs[hc + h])));
+        }
+
+        float comb[hc*hc];
+        for (int64_t isrc = 0; isrc < hc; ++isrc) {
+            float max = -INFINITY;
+            for (int64_t idst = 0; idst < hc; ++idst) {
+                const int64_t idx = idst + hc*isrc;
+                comb[idx] = mix[2*hc + idx]*sc[2] + bs[2*hc + idx];
+                max = MAX(max, comb[idx]);
+            }
+            float sum = 0.0f;
+            for (int64_t idst = 0; idst < hc; ++idst) {
+                const int64_t idx = idst + hc*isrc;
+                comb[idx] = expf(comb[idx] - max);
+                sum += comb[idx];
+            }
+            const float inv_sum = 1.0f/sum;
+            for (int64_t idst = 0; idst < hc; ++idst) {
+                const int64_t idx = idst + hc*isrc;
+                comb[idx] = comb[idx]*inv_sum + hc_eps;
+            }
+        }
+        ggml_dsv4_hc_comb_norm_cols(comb, hc_eps);
+        for (int32_t i = 1; i < n_iter; ++i) {
+            ggml_dsv4_hc_comb_norm_rows(comb, hc_eps);
+            ggml_dsv4_hc_comb_norm_cols(comb, hc_eps);
+        }
+        for (int64_t idx = 0; idx < hc*hc; ++idx) {
+            out[2*hc + idx] = comb[idx];
+        }
+    }
+}
+
+void ggml_compute_forward_dsv4_hc_mix(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    ggml_compute_forward_dsv4_hc_mix_f32(params, dst);
+}
+
 // ggml_compute_forward_rwkv_wkv7
 
 static void ggml_compute_forward_rwkv_wkv7_f32(

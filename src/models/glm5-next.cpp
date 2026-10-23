@@ -456,6 +456,22 @@ ggml_tensor * llama_model_glm5_next::graph::build_hc_pre(
     GGML_ASSERT(hc == 4);
     GGML_ASSERT(hc_fn->ne[1] == hc_mix_dim);
 
+    if (cparams.fused_dsv4_hc_mix && il >= 0) {
+        // [pre (hc), post (hc), comb (hc*hc as dst + hc*src)] per token
+        ggml_tensor * mix = ggml_dsv4_hc_mix(ctx0, x, hc_fn, hc_scale, hc_base, norm_rms_eps, hparams.dsv4_hc_eps,
+                (int32_t) hparams.dsv4_hc_sinkhorn_iters);
+        res->add_fused_node({LLM_FUSED_OP_DSV4_HC_MIX, mix, il});
+        cb(mix, "hc_mix", il);
+
+        ggml_tensor * pre = ggml_view_2d(ctx0, mix, hc, nt, mix->nb[1], 0);
+        *post = ggml_view_2d(ctx0, mix, hc, nt, mix->nb[1], hc*sizeof(float));
+        *comb = ggml_view_3d(ctx0, mix, hc, hc, nt, hc*sizeof(float), mix->nb[1], 2*hc*sizeof(float));
+        cb(pre, "hc_pre", il);
+        cb(*post, "hc_post", il);
+        cb(*comb, "hc_comb", il);
+        return build_hc_pre(x, pre, il);
+    }
+
     ggml_tensor * flat = ggml_reshape_2d(ctx0, x, hc_dim, nt);
     ggml_tensor * flat_norm = ggml_rms_norm(ctx0, flat, norm_rms_eps);
     ggml_tensor * mixes = ggml_mul_mat(ctx0, hc_fn, flat_norm);

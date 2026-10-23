@@ -1069,6 +1069,15 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
             {
                 op_tensor = ggml_scale(ctx, w, 1.0f);
             } break;
+        case GGML_OP_DSV4_HC_MIX:
+            {
+                // the HC mix weight is read as is, so this also keeps it out of a repacked buffer
+                const int64_t hc = 4;
+                ggml_tensor * x     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, w->ne[0]/hc, hc, 1);
+                ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3);
+                ggml_tensor * base  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, w->ne[1]);
+                op_tensor = ggml_dsv4_hc_mix(ctx, x, w, scale, base, 1e-6f, 1e-6f, 1);
+            } break;
         default:
             GGML_ABORT("%s: missing test for op %s for tensor %s", __func__, ggml_op_name(op), w->name);
     }

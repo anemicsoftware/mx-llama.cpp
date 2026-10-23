@@ -585,6 +585,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_DSV4_HC_MIX,
 
         GGML_OP_UNARY,
 
@@ -2731,6 +2732,22 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // hc_mix: the whole HC coefficient chain of a sublayer in one op
+    //   x [n_embd, hc, n_tokens], fn [hc*n_embd, (2 + hc)*hc], scale [3], base [(2 + hc)*hc] -> [(2 + hc)*hc, n_tokens]
+    //   mixes = fn @ rms_norm(flatten(x), eps)
+    //   result[0:hc]    = sigmoid(mixes[0:hc]*scale[0] + base[0:hc]) + hc_eps          (pre)
+    //   result[hc:2*hc] = 2*sigmoid(mixes[hc:2*hc]*scale[1] + base[hc:2*hc])            (post)
+    //   result[2*hc:]   = dsv4_hc_comb(mixes, scale, base, hc_eps, n_iter), [dst + hc*src] (comb)
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * fn,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * base,
+            float                 eps,
+            float                 hc_eps,
+            int32_t               n_iter);
 
     // custom operators
 

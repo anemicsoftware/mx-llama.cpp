@@ -4412,6 +4412,146 @@ struct test_dsv4_hc : public test_case {
     }
 };
 
+struct test_dsv4_hc_mix : public test_dsv4_hc {
+    const ggml_type type_fn;
+    const int64_t n_embd;
+    const int64_t n_tokens;
+    const int32_t n_iter;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_MIX";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(type_fn, n_embd, n_tokens, n_iter);
+    }
+
+    test_dsv4_hc_mix(ggml_type type_fn = GGML_TYPE_Q2_K, int64_t n_embd = 256, int64_t n_tokens = 3, int32_t n_iter = 20)
+        : type_fn(type_fn), n_embd(n_embd), n_tokens(n_tokens), n_iter(n_iter) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            float lo, hi;
+            if (name == "fn") {
+                // small weights keep the mixes O(1), where the gates and the Sinkhorn are not saturated
+                const float a = 2.0f/sqrtf((float) t->ne[0]);
+                init_tensor_uniform(t, -a, a);
+                continue;
+            }
+            if (!tensor_range(name, lo, hi)) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            std::mt19937 rng(tensor_seed(t));
+            std::uniform_real_distribution<float> dist(lo, hi);
+            std::vector<float> data(ggml_nelements(t));
+            for (float & v : data) {
+                v = dist(rng);
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * fn = ggml_new_tensor_2d(ctx, type_fn, n_embd*hc, (2 + hc)*hc);
+        ggml_set_name(fn, "fn");
+        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3);
+        ggml_set_name(scale, "scale");
+        ggml_tensor * base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (2 + hc)*hc);
+        ggml_set_name(base, "base");
+
+        out = ggml_dsv4_hc_mix(ctx, x, fn, scale, base, 1e-6f, 1e-6f, n_iter);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// HC sublayer transition (fused by the CUDA backend at decode): HC_POST -> HC_MIX -> HC_PRE -> RMS_NORM -> MUL
+struct test_dsv4_hc_step : public test_dsv4_hc {
+    const int64_t n_embd;
+    const int64_t n_tokens;
+    const ggml_type type_fn;
+    const bool    cur; // GLM-5-Next: the collapse's pre gate is a view of THIS mix
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_STEP";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_embd, n_tokens, type_fn, cur);
+    }
+
+    bool run_whole_graph() override {
+        return true;
+    }
+
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+
+    test_dsv4_hc_step(int64_t n_embd = 512, int64_t n_tokens = 1, ggml_type type_fn = GGML_TYPE_Q2_K, bool cur = false)
+        : n_embd(n_embd), n_tokens(n_tokens), type_fn(type_fn), cur(cur) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            float lo, hi;
+            if (name == "fn") {
+                const float a = 2.0f/sqrtf((float) t->ne[0]);
+                init_tensor_uniform(t, -a, a);
+                continue;
+            }
+            if (!tensor_range(name, lo, hi)) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            std::mt19937 rng(tensor_seed(t));
+            std::uniform_real_distribution<float> dist(lo, hi);
+            std::vector<float> data(ggml_nelements(t));
+            for (float & v : data) {
+                v = dist(rng);
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * f = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(f, "x");
+        ggml_tensor * X = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(X, "residual");
+        ggml_tensor * prev = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (2 + hc)*hc, n_tokens);
+        ggml_set_name(prev, "comb");
+        ggml_tensor * fn = ggml_new_tensor_2d(ctx, type_fn, n_embd*hc, (2 + hc)*hc);
+        ggml_set_name(fn, "fn");
+        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3);
+        ggml_set_name(scale, "scale");
+        ggml_tensor * base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (2 + hc)*hc);
+        ggml_set_name(base, "base");
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * pre  = ggml_view_2d(ctx, prev, hc, n_tokens, prev->nb[1], 0);
+        ggml_tensor * post = ggml_view_2d(ctx, prev, hc, n_tokens, prev->nb[1], hc*sizeof(float));
+        ggml_tensor * comb = ggml_view_3d(ctx, prev, hc, hc, n_tokens, hc*sizeof(float), prev->nb[1], 2*hc*sizeof(float));
+
+        ggml_tensor * Xn  = ggml_dsv4_hc_post(ctx, f, X, post, comb);
+        ggml_tensor * mix = ggml_dsv4_hc_mix(ctx, Xn, fn, scale, base, 1e-6f, 1e-6f, 20);
+        ggml_tensor * y   = ggml_dsv4_hc_pre(ctx, Xn, cur ? ggml_view_2d(ctx, mix, hc, n_tokens, mix->nb[1], 0) : pre);
+        y = ggml_rms_norm(ctx, y, 1e-6f);
+        y = ggml_mul(ctx, y, w);
+
+        out = ggml_concat(ctx, ggml_concat(ctx, mix, y, 0), ggml_reshape_2d(ctx, Xn, n_embd*hc, n_tokens), 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_dsv4_hc_comb : public test_dsv4_hc {
     const int64_t n_tokens;
     const int32_t n_iter;
@@ -7384,6 +7524,102 @@ enum MoeGatingFunc {
     GATING_FUNC_SQRT_SOFTPLUS,
 };
 
+struct test_router_topk : public test_case {
+    const int64_t k, n_expert;
+    const int n_expert_used;
+    const float scale_w;
+    const bool sigmoid; // GLM-5-Next: f32 router weights, sigmoid gating
+    const bool f16w;    // DeepSeek V4 Flash: f16 router weights
+    const int64_t n_tokens;
+    ggml_tensor * weights {};
+    ggml_tensor * selected_experts {};
+
+    test_router_topk(int64_t k = 1024, int64_t n_expert = 384, int n_expert_used = 6, float scale_w = 2.5f, bool sigmoid = false,
+            bool f16w = false, int64_t n_tokens = 1)
+        : k(k), n_expert(n_expert), n_expert_used(n_expert_used), scale_w(scale_w), sigmoid(sigmoid), f16w(f16w),
+          n_tokens(n_tokens) {}
+
+    std::string vars() override {
+        std::string v = VARS_TO_STR6(k, n_expert, n_expert_used, scale_w, sigmoid, f16w);
+        return n_tokens == 1 ? v : v + ",n_tokens=" + std::to_string(n_tokens);
+    }
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "ROUTER_TOPK"; }
+    bool run_whole_graph() override { return true; }
+    // the CPU bf16 dot product rounds x to bf16 (the GPU keeps f32): weights differ at ~1e-7 NMSE, the selection matches
+    double max_nmse_err() override { return 5e-4; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * W = ggml_new_tensor_2d(ctx, sigmoid ? GGML_TYPE_F32 : f16w ? GGML_TYPE_F16 : GGML_TYPE_BF16, k, n_expert);
+        ggml_set_name(W, "gate_inp");
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * logits = ggml_mul_mat(ctx, W, x);
+        ggml_tensor * probs  = sigmoid ? ggml_sigmoid(ctx, logits) : ggml_sqrt(ctx, ggml_softplus(ctx, logits));
+        ggml_tensor * bias   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert);
+        ggml_set_name(bias, "exp_probs_b");
+        ggml_tensor * sel    = ggml_add(ctx, probs, bias);
+        selected_experts = ggml_argsort_top_k(ctx, sel, n_expert_used);
+        ggml_set_name(selected_experts, "selected_experts");
+        weights = ggml_get_rows(ctx, ggml_reshape_3d(ctx, probs, 1, n_expert, n_tokens), selected_experts);
+        weights = ggml_reshape_2d(ctx, weights, n_expert_used, n_tokens);
+        ggml_tensor * wsum = ggml_clamp(ctx, ggml_sum_rows(ctx, weights), 6.103515625e-5, INFINITY);
+        weights = ggml_div(ctx, weights, wsum);
+        weights = ggml_reshape_3d(ctx, weights, 1, n_expert_used, n_tokens);
+        weights = ggml_scale(ctx, weights, scale_w);
+        ggml_set_name(weights, "weights");
+        return weights;
+    }
+    // sigmoid: logits of a few units, so the sigmoid does not saturate
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (sigmoid && strcmp(t->name, "gate_inp") == 0) {
+                init_tensor_uniform(t, -0.1f, 0.1f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { selected_experts, weights }; }
+    // each token's experts in any order
+    double err(const float * a, const float * b, size_t n) override {
+        std::vector<float> a2(a, a + n), b2(b, b + n);
+        const size_t r = n % n_expert_used == 0 ? n_expert_used : n;
+        for (size_t i = 0; i + r <= n; i += r) {
+            std::sort(a2.begin() + i, a2.begin() + i + r);
+            std::sort(b2.begin() + i, b2.begin() + i + r);
+        }
+        return nmse(a2.data(), b2.data(), n);
+    }
+};
+
+// GLM-5-Next KDA gate: ADD(f, dt) -> RESHAPE -> MUL(a per head) -> SCALE(-1) -> SIGMOID -> SCALE(lb), fused on CUDA
+struct test_kda_gate : public test_case {
+    const int64_t head_dim, n_head, n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "KDA_GATE"; }
+    std::string vars() override { return VARS_TO_STR3(head_dim, n_head, n_tokens); }
+    bool run_whole_graph() override { return true; }
+
+    test_kda_gate(int64_t head_dim = 128, int64_t n_head = 16, int64_t n_tokens = 1)
+        : head_dim(head_dim), n_head(n_head), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * f  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_dim*n_head, n_tokens);
+        ggml_tensor * dt = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim*n_head);
+        ggml_tensor * a  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_head, 1);
+        ggml_set_name(f, "f");
+        ggml_set_name(dt, "dt");
+        ggml_set_name(a, "a");
+        ggml_tensor * g = ggml_add(ctx, f, dt);
+        g = ggml_reshape_3d(ctx, g, head_dim, n_head, n_tokens);
+        g = ggml_mul(ctx, g, a);
+        g = ggml_sigmoid(ctx, ggml_scale(ctx, g, -1.0f));
+        g = ggml_scale(ctx, g, -5.0f);
+        ggml_set_name(g, "out");
+        return g;
+    }
+};
+
 struct test_topk_moe : public test_case {
     const std::array<int64_t, 4> ne;
     const int n_expert_used;
@@ -9880,6 +10116,39 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
         }
+    }
+    for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_F32, GGML_TYPE_F16}) {
+        for (int64_t n_embd : {256, 320, 4096}) {
+            for (int64_t n_tokens : {1, 3, 17}) {
+                test_cases.emplace_back(new test_dsv4_hc_mix(t, n_embd, n_tokens, 20));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_dsv4_hc_mix(GGML_TYPE_F32, 100, 5, 1));
+    // prefill path (CUDA: n_embd % 512 == 0, >= 65 tokens)
+    test_cases.emplace_back(new test_dsv4_hc_mix(GGML_TYPE_Q8_0, 4096, 100, 20));
+    test_cases.emplace_back(new test_dsv4_hc_mix(GGML_TYPE_Q8_0, 4096, 1030, 20));
+    test_cases.emplace_back(new test_dsv4_hc_mix(GGML_TYPE_F16, 4096, 70, 20));
+    for (int64_t n_tokens : {1, 3, 40, 64}) {
+        // GLM-5-Next: q8_0 hc_fn, the collapse gated by this mix
+        for (int64_t n_embd : {256, 512, 4096}) {
+            test_cases.emplace_back(new test_dsv4_hc_step(n_embd, n_tokens, GGML_TYPE_Q8_0));
+            test_cases.emplace_back(new test_dsv4_hc_step(n_embd, n_tokens, GGML_TYPE_Q8_0, true));
+        }
+        for (int64_t n_embd : {256, 4096}) {
+            test_cases.emplace_back(new test_dsv4_hc_step(n_embd, n_tokens, GGML_TYPE_F16, true));
+        }
+    }
+    test_cases.emplace_back(new test_router_topk(1024, 384, 6));
+    test_cases.emplace_back(new test_router_topk(5120, 384, 6));
+    // GLM-5-Next: f32 [4096 x 288], sigmoid, top 8, 1..4 tokens
+    for (int64_t nt : {1, 2, 4}) {
+        test_cases.emplace_back(new test_router_topk(4096, 288, 8, 2.5f, true, false, nt));
+    }
+    test_cases.emplace_back(new test_router_topk(1024, 288, 8, 2.5f, true));
+    for (int64_t nt : {1, 3, 64}) {
+        test_cases.emplace_back(new test_kda_gate(128, 16, nt));
+        test_cases.emplace_back(new test_kda_gate(128, 64, nt));
     }
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true));
