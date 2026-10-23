@@ -66,7 +66,8 @@ bool ggml_cuda_repack_mul_mat_should_fire(const ggml_tensor * src0) {
 // for every token count instead, so it must not be offered the fusion.
 bool ggml_cuda_repack_mmv_fusion_supported(const ggml_tensor * src0) {
     const ggml_tensor * t = src0->view_src != nullptr ? src0->view_src : src0;
-    return (t->type == GGML_TYPE_Q8_0 || t->type == GGML_TYPE_MXFP4) &&
+    // the dense fused host loop does not step the weight per ne02 slice
+    return (t->type == GGML_TYPE_Q8_0 || t->type == GGML_TYPE_MXFP4) && src0->ne[2] == 1 &&
            ggml_cuda_repack_mul_mat_should_fire(src0);
 }
 

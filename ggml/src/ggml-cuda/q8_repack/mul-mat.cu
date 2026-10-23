@@ -42,6 +42,14 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
         w = (const uint8_t *) src0->data;
     }
 
+    // A 3D weight (e.g. MLA wk_b / wv_b) holds one repacked matrix per ne02 slice; src1 slices broadcast over them.
+    // The view cache packs all slices into one plane pair, so it has no per-slice stride.
+    const int64_t ne02 = src0->ne[2];
+    GGML_ASSERT(src0->ne[3] == 1 && ne12 % ne02 == 0);
+    GGML_ASSERT(ne02 == 1 || src0->view_src == nullptr);
+    const int64_t r2       = ne12 / ne02;
+    const size_t  w_stride = repack_gcn_nbytes(src0->type, ne00, ne01);
+
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     const int64_t x_stride    = ne10_padded / QK8_1;
 
@@ -64,37 +72,38 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
             const block_q8_1 * xq = src1_q8_1_d
                               + (i3 * ne12 + i2) * ne11 * x_stride;
             float * dst_d = (float *)((char *) dst->data + i3 * dst->nb[3] + i2 * dst->nb[2]);
+            const uint8_t * w_i = w + (i2 / r2) * w_stride;
             if (ne11 == 1) {
-                ggml_cuda_mul_mat_repacked_slice(ctx, src0, w, xq, dst_d,
+                ggml_cuda_mul_mat_repacked_slice(ctx, src0, w_i, xq, dst_d,
                     ne00, ne01, ne11, stream);
             } else {
                 switch (src0->type) {
                     case GGML_TYPE_Q8_0:
-                        ggml_cuda_mul_mat_repacked_nc_t<GGML_TYPE_Q8_0>(w, xq, dst_d,
+                        ggml_cuda_mul_mat_repacked_nc_t<GGML_TYPE_Q8_0>(w_i, xq, dst_d,
                             ne00, ne01, ne11, (uint32_t) x_stride, dst_s1, stream);
                         break;
                     case GGML_TYPE_MXFP4:
-                        ggml_cuda_mul_mat_repacked_nc_t<GGML_TYPE_MXFP4>(w, xq, dst_d,
+                        ggml_cuda_mul_mat_repacked_nc_t<GGML_TYPE_MXFP4>(w_i, xq, dst_d,
                             ne00, ne01, ne11, (uint32_t) x_stride, dst_s1, stream);
                         break;
                     case GGML_TYPE_IQ4_NL:
-                        ggml_cuda_mul_mat_repacked_nc_t<GGML_TYPE_IQ4_NL>(w, xq, dst_d,
+                        ggml_cuda_mul_mat_repacked_nc_t<GGML_TYPE_IQ4_NL>(w_i, xq, dst_d,
                             ne00, ne01, ne11, (uint32_t) x_stride, dst_s1, stream);
                         break;
                     case GGML_TYPE_Q5_1:
-                        ggml_cuda_mul_mat_repacked_nc_t<GGML_TYPE_Q5_1>(w, xq, dst_d,
+                        ggml_cuda_mul_mat_repacked_nc_t<GGML_TYPE_Q5_1>(w_i, xq, dst_d,
                             ne00, ne01, ne11, (uint32_t) x_stride, dst_s1, stream);
                         break;
                     case GGML_TYPE_Q5_K:
-                        ggml_cuda_mul_mat_repacked_nc_t<GGML_TYPE_Q5_K>(w, xq, dst_d,
+                        ggml_cuda_mul_mat_repacked_nc_t<GGML_TYPE_Q5_K>(w_i, xq, dst_d,
                             ne00, ne01, ne11, (uint32_t) x_stride, dst_s1, stream);
                         break;
                     case GGML_TYPE_Q4_K:
-                        ggml_cuda_mul_mat_repacked_nc_t<GGML_TYPE_Q4_K>(w, xq, dst_d,
+                        ggml_cuda_mul_mat_repacked_nc_t<GGML_TYPE_Q4_K>(w_i, xq, dst_d,
                             ne00, ne01, ne11, (uint32_t) x_stride, dst_s1, stream);
                         break;
                     case GGML_TYPE_Q6_K:
-                        ggml_cuda_mul_mat_repacked_nc_t<GGML_TYPE_Q6_K>(w, xq, dst_d,
+                        ggml_cuda_mul_mat_repacked_nc_t<GGML_TYPE_Q6_K>(w_i, xq, dst_d,
                             ne00, ne01, ne11, (uint32_t) x_stride, dst_s1, stream);
                         break;
                     default: GGML_ABORT("unsupported repack type");
@@ -163,7 +172,8 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
             const block_q8_1 * xq = reinterpret_cast<const block_q8_1 *>(slice_base);
             float * dst_d = (float *)((char *) dst->data + i3 * dst->nb[3] + i2 * dst->nb[2])
                            + col*dst_s1;
-            ggml_cuda_mul_mat_repacked_slice(ctx, src0, w, xq, dst_d,
+            const uint8_t * w_i = w + (i2 / r2) * w_stride;
+            ggml_cuda_mul_mat_repacked_slice(ctx, src0, w_i, xq, dst_d,
                 ne00, ne01, iter_ne11, stream);
         }
         }
