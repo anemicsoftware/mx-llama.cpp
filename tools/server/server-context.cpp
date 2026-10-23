@@ -4144,7 +4144,12 @@ private:
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         if (do_checkpoint) {
-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+                            // the last chunk takes the shape of the first decode batch (the verify batch with speculative
+                            // decoding, else 1 token), so that batch reuses its graph (LLAMA_CKPT_LAST_VERIFY=0: 4 tokens)
+                            static const bool ckpt_last_verify = [] { const char * e = getenv("LLAMA_CKPT_LAST_VERIFY"); return !e || atoi(e) != 0; }();
+                            const int n_last_chunk = !ckpt_last_verify ? 4 :
+                                slot.can_speculate() ? params_base.speculative.draft.n_max + 1 : 1;
+                            const int checkpoint_offsets[] = {4 + n_ubatch, n_last_chunk};
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {

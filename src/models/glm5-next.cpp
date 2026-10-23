@@ -1,6 +1,24 @@
 #include "models.h"
 #include "llama-memory-hybrid-idx.h"
 
+// LLAMA_MTP_DRAFT_VOCAB=K: the draft scores only the first K token ids (the frequent BPE merges). The target still
+// verifies every draft. The scores are padded back to n_vocab 1e4 below the real ones, so sampling is unchanged. Not
+// under -sm tensor, where the head is split along the vocabulary.
+template <typename MM>
+static ggml_tensor * mtp_draft_head(ggml_context * ctx0, const llama_model & model, ggml_tensor * head_w,
+                                    ggml_tensor * head_s, ggml_tensor * cur, const MM & mm) {
+    static const int64_t draft_vocab = [] { const char * e = getenv("LLAMA_MTP_DRAFT_VOCAB"); return e ? atoll(e) : 0; }();
+    const int64_t n_vocab_head = head_w->ne[1];
+    if (draft_vocab <= 0 || draft_vocab >= n_vocab_head || model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+        return mm(head_w, cur, head_s);
+    }
+    ggml_tensor * w_sub = ggml_view_2d(ctx0, head_w, head_w->ne[0], draft_vocab, head_w->nb[1], 0);
+    cur = mm(w_sub, cur, head_s);
+    cur = ggml_scale_bias(ctx0, cur, 1.0f, 1.0e4f);
+    cur = ggml_pad(ctx0, cur, (int) (n_vocab_head - draft_vocab), 0, 0, 0);
+    return ggml_scale_bias(ctx0, cur, 1.0f, -1.0e4f);
+}
+
 // GLM5-Next (GLM-5.3-Flash): hybrid KDA (linear) + nope MLA with a k-pool DSA indexer,
 // mHC residual streams, DeepSeek-style MoE.
 
@@ -679,7 +697,8 @@ llama_model_glm5_next::graph_mtp::graph_mtp(const llama_model & model, const llm
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "GLM5-Next MTP: missing both nextn.shared_head_head and output");
-    cur = build_lora_mm(head_w, cur, head_s);
+    cur = mtp_draft_head(ctx0, model, head_w, head_s, cur,
+            [&](ggml_tensor * w, ggml_tensor * x, ggml_tensor * ws) { return build_lora_mm(w, x, ws); });
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;

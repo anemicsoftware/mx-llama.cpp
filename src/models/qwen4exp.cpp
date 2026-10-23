@@ -6,6 +6,24 @@
 #include <algorithm>
 #include <cinttypes>
 
+// LLAMA_MTP_DRAFT_VOCAB=K: the draft scores only the first K token ids (the frequent BPE merges). The target still
+// verifies every draft. The scores are padded back to n_vocab 1e4 below the real ones, so sampling is unchanged. Not
+// under -sm tensor, where the head is split along the vocabulary.
+template <typename MM>
+static ggml_tensor * mtp_draft_head(ggml_context * ctx0, const llama_model & model, ggml_tensor * head_w,
+                                    ggml_tensor * head_s, ggml_tensor * cur, const MM & mm) {
+    static const int64_t draft_vocab = [] { const char * e = getenv("LLAMA_MTP_DRAFT_VOCAB"); return e ? atoll(e) : 0; }();
+    const int64_t n_vocab_head = head_w->ne[1];
+    if (draft_vocab <= 0 || draft_vocab >= n_vocab_head || model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+        return mm(head_w, cur, head_s);
+    }
+    ggml_tensor * w_sub = ggml_view_2d(ctx0, head_w, head_w->ne[0], draft_vocab, head_w->nb[1], 0);
+    cur = mm(w_sub, cur, head_s);
+    cur = ggml_scale_bias(ctx0, cur, 1.0f, 1.0e4f);
+    cur = ggml_pad(ctx0, cur, (int) (n_vocab_head - draft_vocab), 0, 0, 0);
+    return ggml_scale_bias(ctx0, cur, 1.0f, -1.0e4f);
+}
+
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
     if (value == 0) {
@@ -647,7 +665,8 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = mtp_draft_head(ctx0, model, model.output, model.output_s, cur,
+            [&](ggml_tensor * w, ggml_tensor * x, ggml_tensor * ws) { return build_lora_mm(w, x, ws); });
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 }
