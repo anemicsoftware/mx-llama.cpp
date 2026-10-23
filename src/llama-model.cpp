@@ -449,6 +449,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 ||
         ud->model->arch == LLM_ARCH_DEEPSEEK41 ||
         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
+    // Absorbed MLA with a plain attn_output: q_b, the per-head k_b / v_b and attn_output split by head.
+    const bool is_mla_plain = ud->model->arch == LLM_ARCH_MISTRAL4;
 
     static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
     static const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");
@@ -470,6 +472,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_attn_out_a_weight("blk\\.\\d*\\.attn_output_a\\.weight");
     static const std::regex pattern_attn_out_b_weight("blk\\.\\d*\\.attn_output_b\\.weight");
     static const std::regex pattern_attn_q_b_weight ("blk\\.\\d*\\.attn_q_b\\.weight");
+    static const std::regex pattern_attn_kv_b_weight("blk\\.\\d*\\.attn_(k|v)_b\\.weight");
     static const std::regex pattern_attn_gate_weight("blk\\.\\d*\\.attn_gate.weight");
 
     // Shared-expert split, see LLAMA_SHEXP_SPLIT below
@@ -620,9 +623,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     // Left out of the gate, V4.1 fell through to the design-A mirror and kept a full copy of attn_q_b, attn_output_a and attn_output_b on every device, 4.65 GiB per card of the 5.70 GiB that overflowed them.
     const bool head_split_attention = mla_tp_env && replicate_attention &&
                                       (ud->model->arch == LLM_ARCH_DEEPSEEK4 ||
-                                       ud->model->arch == LLM_ARCH_DEEPSEEK41 || dflash_dsv4_split);
+                                       ud->model->arch == LLM_ARCH_DEEPSEEK41 || dflash_dsv4_split || is_mla_plain);
     if (mla_tp_env && replicate_attention && !head_split_attention) {
-        LLAMA_LOG_WARN("%s: LLAMA_MLA_TP is only implemented for deepseek4, using design A\n", __func__);
+        LLAMA_LOG_WARN("%s: LLAMA_MLA_TP is only implemented for deepseek4 and mistral4, using design A\n", __func__);
     }
     if (head_split_attention) {
         // A device must own whole output groups for the wo_a group split to be valid, and
@@ -632,7 +635,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         // the total instead would wrongly reject e.g. 6 or 10 GPUs at -tps 2, which are
         // perfectly valid (3 or 5 pipeline stages of a 2-wide group).
         // A drafter that fails these has already fallen back to replication above.
-        GGML_ASSERT(tp_width_eff > 0 && hparams.dsv4_o_group_count % tp_width_eff == 0 &&
+        GGML_ASSERT(tp_width_eff > 0 && (is_mla_plain || hparams.dsv4_o_group_count % tp_width_eff == 0) &&
                     "LLAMA_MLA_TP needs the TP group width to divide the output group count");
         GGML_ASSERT(hparams.n_head() % tp_width_eff == 0 &&
                     "LLAMA_MLA_TP needs the TP group width to divide the head count");
@@ -715,7 +718,19 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             }
         }
-        if (head_split_attention) {
+        if (head_split_attention && is_mla_plain) {
+            // q_b column-parallel, k_b / v_b on their head axis, attn_output row-parallel (PARTIAL, reduced with
+            // the experts). The latent KV and its projections stay mirrored below. The sibling gives the granularity.
+            if (std::regex_match(tensor_name, pattern_attn_q_b_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_attn_kv_b_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2, "attn_output.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+            }
+        } else if (head_split_attention) {
             if (std::regex_match(tensor_name, pattern_attn_q_b_weight)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output_a.weight");
             }
@@ -1001,6 +1016,24 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
     auto get_split_granularity = [&](int64_t blck_size, uint32_t il, const std::vector<std::pair<int64_t, uint32_t>> & segments) -> std::vector<int64_t> {
         // for better performance it may make sense to round up blck_size to a higher power of 2 so that more efficient kernels can be used
+        if (head_split_attention && is_mla_plain) {
+            // One granule is the fewest whole heads whose attn_output columns fill whole quant blocks.
+            // All four tensors then split on the same head boundaries for any lane count or tensor split.
+            const int64_t n_v      = hparams.n_embd_head_v_mla();
+            const int64_t n_head_g = std::lcm(blck_size, n_v) / n_v;
+            if (std::regex_match(tensor_name, pattern_attn_q_b_weight)) {
+                GGML_ASSERT(segments.size() == 1);
+                return {n_head_g * hparams.n_embd_head_k_mla()};
+            }
+            if (std::regex_match(tensor_name, pattern_attn_kv_b_weight)) {
+                GGML_ASSERT(segments.size() == 1);
+                return {n_head_g};
+            }
+            if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
+                GGML_ASSERT(segments.size() == 1);
+                return {n_head_g * n_v};
+            }
+        }
         if (hparams.is_recr(il)) {
             // linear attention
             const int64_t head_dim        = hparams.ssm_d_state;

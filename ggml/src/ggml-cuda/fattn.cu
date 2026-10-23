@@ -598,7 +598,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             if (V->ne[0] != 256 || !gqa_opt_applies) {
                 return BEST_FATTN_KERNEL_NONE;
             }
-            if (gqa_ratio % 32 != 0) {
+            // AMD runs 320 on the tile kernel, which also has 16 and 8 for a head split under -sm tensor
+            if (gqa_ratio % 32 != 0 && !(GGML_CUDA_CC_IS_AMD(cc) && gqa_ratio % 8 == 0)) {
                 return BEST_FATTN_KERNEL_NONE;
             }
             break;
