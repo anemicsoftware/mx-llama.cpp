@@ -980,6 +980,16 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_denominator > 0.0f ? VKQ_numerator / VKQ_denominator : 0.0f;
 }
 
+// set by a caller that already knows the last KV row each query tile needs (the GCN sparse path: the gathered union
+// of visible columns, padded to 256): [n_seq][ntiles_x] ints, used instead of scanning the mask
+extern thread_local const int * ggml_cuda_fattn_kv_max_override;
+// set by the tile kernel's launcher on HIP: that kernel takes parallel_blocks on grid z and the head groups on grid y
+extern thread_local bool ggml_cuda_fattn_tile_swap_yz;
+// set by the GCN sparse prefill path: the tile kernel reads K/V rows through the index lists after the KV_max entries of
+// ggml_cuda_fattn_kv_max_override (only the D 512, 16-column instance)
+extern thread_local bool ggml_cuda_fattn_tile_kv_idx;
+extern thread_local bool ggml_cuda_fattn_tile_kv_idx_used; // set by the launcher when it picked that instance
+
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
@@ -1117,7 +1127,7 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    const bool scan_mask = !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1);
+    const bool scan_mask = !use_sparse && !ggml_cuda_fattn_kv_max_override && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1);
     if (scan_mask) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
@@ -1258,6 +1268,9 @@ void launch_fattn(
                     __func__, id, failed_blocks, parallel_blocks);
         }
         blocks_num.y = parallel_blocks;
+        if (ggml_cuda_fattn_tile_swap_yz) {
+            std::swap(blocks_num.y, blocks_num.z);
+        }
     }
 
     float scale         = 1.0f;
@@ -1290,7 +1303,7 @@ void launch_fattn(
         V_data,
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
-        KV_max.ptr,
+        ggml_cuda_fattn_kv_max_override && !use_sparse ? ggml_cuda_fattn_kv_max_override : KV_max.ptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],

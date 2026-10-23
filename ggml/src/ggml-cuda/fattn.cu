@@ -4,6 +4,8 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
+#include "fattn-sparse-gcn.cuh"
+#include "fattn-dense-gcn.cuh"
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 // one list per group of ncols1 queries: a column is selected if any query of the group can see it
@@ -757,6 +759,25 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+    // GCN decode with a long (and possibly sparse) KV: visible rows only, once per KV head (fattn-sparse-gcn.cu)
+    if (ggml_cuda_flash_attn_ext_supported(ctx.device, dst) && ggml_cuda_flash_attn_sparse_gcn_supported(dst)) {
+        ggml_cuda_flash_attn_sparse_gcn(ctx, dst);
+        return;
+    }
+    // GCN prefill with a sparse selection: per tile of consecutive queries, gathered rows only
+    if (ggml_cuda_flash_attn_ext_supported(ctx.device, dst) && ggml_cuda_flash_attn_sparse_prefill_gcn_supported(dst)) {
+        ggml_cuda_flash_attn_sparse_prefill_gcn(ctx, dst);
+        return;
+    }
+    // GCN decode / verify of a 512-dim latent MQA (GLM-5-Next), the cases above aside
+    if (ggml_cuda_flash_attn_ext_supported(ctx.device, dst) && ggml_cuda_flash_attn_mqa512_gcn_supported(dst)) {
+        ggml_cuda_flash_attn_mqa512_gcn(ctx, dst);
+        return;
+    }
+    // GCN prefill with D = 256: dense attention in 48-row groups with f32 accumulation (fattn-dense-gcn.cu)
+    if (ggml_cuda_flash_attn_ext_dense_gcn(ctx, dst)) {
+        return;
+    }
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");

@@ -10150,6 +10150,38 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_kda_gate(128, 16, nt));
         test_cases.emplace_back(new test_kda_gate(128, 64, nt));
     }
+    // GCN attention (fattn-sparse-gcn.cu, fattn-dense-gcn.cu): GLM-5-Next latent MQA (512-dim row as K and V, 16 query
+    // heads under TP4) with and without the n_kv_max hint, qwen4exp decode (D 256, GQA 6) and D 256 prefill
+    for (int64_t kv : {256, 1000, 8192}) {
+        for (int64_t nb : {1, 2, 6, 64}) {
+            for (int64_t nkm : {(int64_t) 0, (int64_t) 2051}) {
+                if (nkm > kv) {
+                    continue;
+                }
+                test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {16, 1}, kv, nb, true, false, 0.0f, 0.0f,
+                        GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, nkm));
+            }
+        }
+    }
+    for (int64_t kv : {4096, 33024}) {
+        for (int64_t nkm : {(int64_t) 0, (int64_t) 2051}) {
+            if (kv > 4096 && nkm == 0) {
+                continue; // the dense tile kernel misses the error bound at 33K cells (also before the GCN paths)
+            }
+            for (int64_t nb : {1, 4}) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32,
+                    GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, nkm));
+            }
+        }
+    }
+    for (int64_t kv : {4608, 16896}) {
+        for (int64_t nb : {64, 512}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_DEFAULT,
+                GGML_TYPE_F16, GGML_TYPE_F16));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {4, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_DEFAULT,
+                GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21, true));
